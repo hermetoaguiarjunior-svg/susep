@@ -1,149 +1,68 @@
 /**
- * probe-susep-rep.js  (GitHub Actions - versao a prova de falhas)
- * Sondagem da Consulta Publica de Produtos da SUSEP (REP).
- * Garante SEMPRE gerar saida-probe/relatorio.json, mesmo se algo der errado,
- * e termina sempre com sucesso (verde) para o resultado poder ser baixado.
+ * probe-susep-rep.js  (GitHub Actions - teste de monitoramento de PDFs)
+ * Agora o teste mira as CONDICOES GERAIS publicadas pelas seguradoras
+ * (PDFs diretos), para confirmar:
+ *   1) se a nuvem do GitHub consegue baixar (sem bloqueio);
+ *   2) quais "pistas de mudanca" o servidor entrega (Last-Modified, ETag,
+ *      tamanho) + uma impressao digital (hash) do arquivo.
+ * Nao precisa do campo "processo" desta vez (pode digitar qualquer coisa).
+ * Sempre gera saida-probe/relatorio.json e termina verde.
  */
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
-const PROCESSO = process.env.PROCESSO || "";
-const URL = "https://www2.susep.gov.br/safe/menumercado/REP2/Produto.aspx/Consultar";
 const OUT = path.join(process.cwd(), "saida-probe");
 fs.mkdirSync(OUT, { recursive: true });
 
-const report = {
-  rodadoEm: new Date().toISOString(),
-  url: URL,
-  processo: PROCESSO,
-  rede: [],
-  campos: [],
-  temCaptcha: null,
-  resultado: {},
-  download: null,
-  erros: [],
-};
+// Enderecos de condicoes gerais da Porto (candidatos a monitorar)
+const ALVOS = [
+  { nome: "Porto - CG Auto (institucional)", url: "https://www.portoseguro.com.br/content/dam/documentos-institicional-porto-seguro/condicoes-gerais-porto.pdf" },
+  { nome: "Porto - CG Auto Frota Tradicional 2025", url: "https://www.portoseguro.com.br/content/dam/documentos/condicoes_gerais/seguro_auto_para_empresas/seguro_auto_frota/2025/CG-Frota-Tradicional-V50-Jan-25.pdf" },
+  { nome: "Porto - CG66 Auto (legado)", url: "https://www.portoseguro.com.br/NovoInstitucional/static_files/CGs/auto/CG66%20Oficial%20ABRL18.pdf" },
+];
 
-const log = (...a) => console.log("•", ...a);
-const save = (file, content) => fs.writeFileSync(path.join(OUT, file), content);
-const writeReport = () => save("relatorio.json", JSON.stringify(report, null, 2));
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-// marca que o script iniciou (se isto sumir, o problema e antes do node)
-save("00-boot.txt", "iniciou em " + new Date().toISOString());
+const report = { rodadoEm: new Date().toISOString(), itens: [], erros: [] };
+const writeReport = () => fs.writeFileSync(path.join(OUT, "relatorio.json"), JSON.stringify(report, null, 2));
 
-// rede de seguranca: qualquer erro nao tratado ainda gera relatorio e sai verde
 process.on("unhandledRejection", (e) => { report.erros.push("unhandledRejection: " + (e && e.stack || e)); writeReport(); process.exit(0); });
 process.on("uncaughtException", (e) => { report.erros.push("uncaughtException: " + (e && e.stack || e)); writeReport(); process.exit(0); });
 
 (async () => {
-  let browser;
-  try {
-    const { chromium } = require("playwright");
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ acceptDownloads: true });
-    const page = await context.newPage();
+  let i = 0;
+  for (const alvo of ALVOS) {
+    i++;
+    const item = { nome: alvo.nome, url: alvo.url };
+    try {
+      console.log("• Baixando:", alvo.nome);
+      const resp = await fetch(alvo.url, { headers: { "User-Agent": UA }, redirect: "follow" });
+      item.status = resp.status;
+      item.contentType = resp.headers.get("content-type");
+      item.contentLength = resp.headers.get("content-length");
+      item.lastModified = resp.headers.get("last-modified"); // data da ultima modificacao
+      item.etag = resp.headers.get("etag");                  // "impressao digital" do servidor
 
-    page.on("request", (req) => {
-      if (req.url().includes("susep.gov.br")) {
-        report.rede.push({ tipo: "request", method: req.method(), url: req.url(), resourceType: req.resourceType() });
+      const buf = Buffer.from(await resp.arrayBuffer());
+      item.bytesBaixados = buf.length;
+      item.sha256 = crypto.createHash("sha256").update(buf).digest("hex"); // nossa impressao digital
+      item.pareceePdf = buf.slice(0, 5).toString("latin1") === "%PDF-"; // confere se e PDF mesmo
+
+      // salva o 1o PDF como prova
+      if (i === 1 && item.pareceePdf) {
+        fs.writeFileSync(path.join(OUT, "amostra-porto.pdf"), buf);
+        item.salvoComo = "amostra-porto.pdf";
       }
-    });
-    page.on("response", (res) => {
-      if (res.url().includes("susep.gov.br")) {
-        const ct = res.headers()["content-type"] || "";
-        report.rede.push({ tipo: "response", status: res.status(), url: res.url(), contentType: ct });
-        if (ct.includes("pdf")) log("PDF detectado:", res.url());
-      }
-    });
-    page.on("download", async (dl) => {
-      const nome = dl.suggestedFilename() || "documento.pdf";
-      const destino = path.join(OUT, nome);
-      await dl.saveAs(destino).catch((e) => report.erros.push("saveAs: " + e.message));
-      report.download = { via: "page.download", suggestedFilename: nome, url: dl.url() };
-      log("Download capturado:", nome);
-    });
-
-    // 1) abre a tela e mapeia os campos
-    log("Abrindo", URL);
-    await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(1500);
-    save("01-tela-inicial.html", await page.content());
-    await page.screenshot({ path: path.join(OUT, "01-tela-inicial.png"), fullPage: true });
-
-    report.campos = await page.$$eval("input, select, button, textarea", (els) =>
-      els.map((e) => ({
-        tag: e.tagName,
-        type: e.getAttribute("type"),
-        id: e.id || null,
-        name: e.getAttribute("name") || null,
-        value: e.getAttribute("value") || null,
-        placeholder: e.getAttribute("placeholder") || null,
-      }))
-    );
-    log("Campos encontrados:", report.campos.length);
-
-    report.temCaptcha = await page.evaluate(() => {
-      const html = document.documentElement.outerHTML.toLowerCase();
-      return /recaptcha|hcaptcha|captcha/.test(html);
-    });
-    log("Tem CAPTCHA?", report.temCaptcha);
-
-    if (!PROCESSO) {
-      report.erros.push("PROCESSO vazio.");
-    } else {
-      const inputSel =
-        (await page.$('input[type="text"]')) ? 'input[type="text"]' :
-        (await page.$("input:not([type=hidden]):not([type=submit]):not([type=button])")) ?
-          "input:not([type=hidden]):not([type=submit]):not([type=button])" : null;
-      if (!inputSel) throw new Error("Campo de texto nao encontrado (veja campos).");
-      log("Campo:", inputSel);
-      await page.fill(inputSel, PROCESSO);
-
-      const botao =
-        (await page.$('input[type="submit"][value*="Buscar" i]')) ? 'input[type="submit"][value*="Buscar" i]' :
-        (await page.$('button:has-text("Buscar")')) ? 'button:has-text("Buscar")' :
-        (await page.$('input[type="submit"]')) ? 'input[type="submit"]' : null;
-      if (!botao) throw new Error("Botao Buscar nao encontrado (veja campos).");
-      log("Botao:", botao);
-
-      await Promise.all([
-        page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {}),
-        page.click(botao),
-      ]);
-      await page.waitForTimeout(2500);
-
-      save("02-resultado.html", await page.content());
-      await page.screenshot({ path: path.join(OUT, "02-resultado.png"), fullPage: true });
-
-      report.resultado.textoVisivel = (await page.evaluate(() => document.body.innerText)).slice(0, 4000);
-      report.resultado.tabelas = await page.$$eval("table", (ts) => ts.map((t) => t.innerText.slice(0, 2000)));
-      report.resultado.links = await page.$$eval("a", (as) =>
-        as.map((a) => ({ texto: (a.innerText || "").trim().slice(0, 80), href: a.href }))
-          .filter((l) => /\.pdf|documento|condic|vers|download|arquivo/i.test(l.texto + " " + l.href))
-      );
-      log("Tabelas:", report.resultado.tabelas.length, "Links doc:", report.resultado.links.length);
-
-      const docLink = report.resultado.links[0];
-      if (docLink && docLink.href) {
-        log("Abrindo documento:", docLink.texto || docLink.href);
-        const [popup] = await Promise.all([
-          context.waitForEvent("page", { timeout: 8000 }).catch(() => null),
-          page.click(`a[href="${docLink.href}"]`).catch(() => {}),
-        ]);
-        await page.waitForTimeout(3000);
-        if (popup) { report.download = report.download || { via: "popup", url: popup.url() }; log("Nova aba:", popup.url()); }
-      } else {
-        report.erros.push("Nenhum link de documento obvio (veja 02-resultado.html).");
-      }
+      console.log("   status", item.status, "| bytes", item.bytesBaixados, "| pdf?", item.pareceePdf);
+    } catch (e) {
+      item.erro = (e && e.message) || String(e);
+      console.log("   ERRO:", item.erro);
     }
-  } catch (e) {
-    report.erros.push("erro: " + (e && e.stack || e));
-    log("ERRO:", e && e.message || e);
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-    writeReport();
-    log("Relatorio salvo. Fim.");
-    process.exit(0);
+    report.itens.push(item);
   }
+  writeReport();
+  console.log("• Relatorio salvo. Fim.");
+  process.exit(0);
 })();
