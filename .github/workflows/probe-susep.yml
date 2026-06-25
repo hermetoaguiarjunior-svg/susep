@@ -1,1 +1,39 @@
+name: Probe SUSEP REP
 
+on:
+  workflow_dispatch:
+    inputs:
+      processo:
+        description: "Numero do processo SUSEP (ex.: 15414.123456/2020-00)"
+        required: true
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar os arquivos do repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar o Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Playwright + Chromium
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Rodar a sondagem
+        env:
+          PROCESSO: ${{ inputs.processo }}
+        run: node probe-susep-rep.js
+
+      - name: Publicar o resultado (saida-probe)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saida-probe
+          path: saida-probe/
